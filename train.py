@@ -46,7 +46,7 @@ except ImportError:
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 500 # 2000
+eval_interval = 100 # 2000
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -249,6 +249,54 @@ def estimate_loss():
     model.train()
     return out
 
+@torch.no_grad()
+def run_diagnostics(raw_model_obj):
+    """Collect diagnostic stats from a single forward pass on val split.
+    Returns dict with per-layer norms (mean over layers).
+    Lightweight: runs one batch with forward hooks.
+    """
+    stats = {
+        'x_norm': [],
+        'out_norm': [],
+        'delta_norm': [],
+        'linmix_norm': [],
+    }
+    hooks = []
+
+    def hook_fn(module, inp, out):
+        x = inp[0]
+        delta = out - x
+        stats['x_norm'].append(x.norm(dim=-1).mean().item())
+        stats['out_norm'].append(out.norm(dim=-1).mean().item())
+        stats['delta_norm'].append(delta.norm(dim=-1).mean().item())
+        if hasattr(module, 'linmix_attn'):
+            lin = module.linmix_attn(x)
+            stats['linmix_norm'].append(lin.norm(dim=-1).mean().item())
+        else:
+            stats['linmix_norm'].append(None)
+
+    for blk in raw_model_obj.transformer.h:
+        hooks.append(blk.register_forward_hook(hook_fn))
+
+    X, Y = get_batch('val')
+    with ctx:
+        raw_model_obj(X, Y)
+
+    for h in hooks:
+        h.remove()
+
+    # aggregate means ignoring None
+    def _mean(vals):
+        vals = [v for v in vals if v is not None]
+        return sum(vals)/len(vals) if vals else None
+
+    return {
+        'x_norm': _mean(stats['x_norm']),
+        'out_norm': _mean(stats['out_norm']),
+        'delta_norm': _mean(stats['delta_norm']),
+        'linmix_norm': _mean(stats['linmix_norm']),
+    }
+
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -279,6 +327,9 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+latest_grad_norm = None
+latest_peak_mem = None
+latest_throughput = None
 while True:
 
     # determine and set the learning rate for this iteration
@@ -293,36 +344,50 @@ while True:
         val_ppl = math.exp(losses['val'])
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         print(f"step {iter_num}: train ppl {train_ppl:.2f}, val ppl {val_ppl:.2f}")
-        
-        # Print linear mixer diagnostics if enabled
+
+        # peak memory (MB)
+        if device_type == 'cuda':
+            latest_peak_mem = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+        # diagnostics and alpha stats
+        diag_stats = None
+        alpha_mean = None
         if has_linmix_analysis:
             try:
                 raw_model_obj = raw_model
                 if hasattr(raw_model_obj, 'config'):
                     if getattr(raw_model_obj.config, 'use_linear_mixer', False):
+                        diag_stats = run_diagnostics(raw_model_obj)
                         metrics = {'train_loss': losses['train'], 'val_loss': losses['val'], 
                                   'train_ppl': train_ppl, 'val_ppl': val_ppl}
                         print_linear_mixer_report(raw_model_obj, iter_num, metrics)
+                        from analyze_linear_mixer import extract_linear_mixer_stats
+                        stats = extract_linear_mixer_stats(raw_model_obj)
+                        if stats['alpha_attn']:
+                            alpha_mean = sum(stats['alpha_attn']) / len(stats['alpha_attn'])
             except Exception as e:
                 if master_process:
-                    print(f"Warning: Could not print linear mixer diagnostics: {e}")
+                    print(f"Warning: Could not run diagnostics: {e}")
         
-        # Log metrics
+        # Log validation metrics
         if metrics_logger:
             try:
-                from analyze_linear_mixer import extract_linear_mixer_stats
-                alpha_mean = None
-                if getattr(raw_model.config, 'use_linear_mixer', False):
-                    stats = extract_linear_mixer_stats(raw_model)
-                    if stats['alpha_attn']:
-                        alpha_mean = sum(stats['alpha_attn']) / len(stats['alpha_attn'])
-                
-                metrics_logger.log(iter_num, losses['train'].item(), losses['val'].item(), 
-                                 lr, alpha_mean)
+                metrics_logger.log_val(
+                    iter_num,
+                    losses['val'].item(),
+                    alpha_mean,
+                    peak_mem_mb=latest_peak_mem,
+                    x_norm=diag_stats['x_norm'] if diag_stats else None,
+                    delta_norm=diag_stats['delta_norm'] if diag_stats else None,
+                    linmix_norm=diag_stats['linmix_norm'] if diag_stats else None,
+                )
                 metrics_logger.save()
             except Exception as e:
                 if master_process:
-                    print(f"Warning: Could not log metrics: {e}")
+                    print(f"Warning: Could not log val metrics: {e}")
+
+        if device_type == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
         
         if wandb_log:
             wandb.log({
@@ -392,7 +457,29 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, ppl {pplf:.2f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        # grad norm
+        grad_sq_sum = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                grad_sq_sum += p.grad.data.float().pow(2).sum().item()
+        latest_grad_norm = math.sqrt(grad_sq_sum) if grad_sq_sum > 0 else None
+        latest_throughput = tokens_per_iter / dt
+        print(f"iter {iter_num}: loss {lossf:.4f}, ppl {pplf:.2f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, grad_norm {latest_grad_norm if latest_grad_norm is not None else 0:.2f}, tok/s {latest_throughput:.2f}")
+        
+        # Log training metrics every iteration
+        if metrics_logger:
+            try:
+                metrics_logger.log_train(
+                    iter_num,
+                    lossf,
+                    lr,
+                    throughput=latest_throughput,
+                    grad_norm=latest_grad_norm,
+                )
+                metrics_logger.save()
+            except Exception as e:
+                if master_process:
+                    print(f"Warning: Could not log train metrics: {e}")
     iter_num += 1
     local_iter_num += 1
 

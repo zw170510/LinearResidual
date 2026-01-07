@@ -21,14 +21,14 @@ dropout = 0.0
 
 # adamw optimizer
 learning_rate = 3e-4
-max_iters = 1000  # Total training iterations
+max_iters = 500  # Total training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 
 # learning rate decay settings
 warmup_iters = 200
-lr_decay_iters = 1000
+lr_decay_iters = 500
 min_lr = 6e-5
 
 # system

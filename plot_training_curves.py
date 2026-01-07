@@ -21,52 +21,92 @@ def create_metrics_logger(out_dir: str):
     return MetricsLogger(out_dir)
 
 class MetricsLogger:
-    """Log and save training metrics to JSON."""
+    """Log and save training and validation metrics separately to JSON."""
     
     def __init__(self, out_dir: str):
         self.out_dir = out_dir
         self.metrics_file = os.path.join(out_dir, 'metrics.json')
         self.metrics = {
-            'iter': [],
-            'train_loss': [],
-            'val_loss': [],
-            'train_ppl': [],
-            'val_ppl': [],
-            'learning_rate': [],
-            'alpha_attn_mean': [],  # For linear mixer
+            'train': {
+                'iter': [],
+                'loss': [],
+                'ppl': [],
+                'learning_rate': [],
+                'throughput': [],       # tokens/sec
+                'grad_norm': [],        # gradient norm
+            },
+            'val': {
+                'iter': [],
+                'loss': [],
+                'ppl': [],
+                'alpha_attn_mean': [],  # For linear mixer
+                'peak_mem_mb': [],      # peak memory MB
+                'x_norm': [],           # activation norm
+                'delta_norm': [],       # representation change norm
+                'linmix_norm': [],      # linear mixer branch norm
+            }
         }
         
         # Load existing metrics if available
         if os.path.exists(self.metrics_file):
             try:
                 with open(self.metrics_file, 'r') as f:
-                    self.metrics = json.load(f)
-                print(f"Loaded {len(self.metrics['iter'])} existing metrics from {self.metrics_file}")
+                    data = json.load(f)
+                    if 'train' in data and 'val' in data:
+                        self.metrics = data
+                    # backward compat: old format converted implicitly (below if needed)
+                print(f"Loaded existing metrics from {self.metrics_file}")
             except Exception as e:
                 print(f"Warning: Could not load existing metrics: {e}")
     
-    def log(self, iter_num: int, train_loss: float, val_loss: float, 
-            learning_rate: float, alpha_attn_mean: float = None):
-        """Log metrics for a training step.
+    def log_train(self, iter_num: int, loss: float, learning_rate: float,
+                  throughput: float = None, grad_norm: float = None):
+        """Log training metrics for each iteration.
         
         Args:
             iter_num: iteration number
-            train_loss: training loss
-            val_loss: validation loss
+            loss: training loss
             learning_rate: current learning rate
-            alpha_attn_mean: mean alpha value (optional, for linear mixer)
+            throughput: tokens/sec
+            grad_norm: gradient norm
         """
-        self.metrics['iter'].append(iter_num)
-        self.metrics['train_loss'].append(train_loss)
-        self.metrics['val_loss'].append(val_loss)
-        self.metrics['train_ppl'].append(math.exp(train_loss))
-        self.metrics['val_ppl'].append(math.exp(val_loss))
-        self.metrics['learning_rate'].append(learning_rate)
+        self.metrics['train']['iter'].append(iter_num)
+        self.metrics['train']['loss'].append(loss)
+        self.metrics['train']['ppl'].append(math.exp(loss))
+        self.metrics['train']['learning_rate'].append(learning_rate)
+        self.metrics['train']['throughput'].append(throughput)
+        self.metrics['train']['grad_norm'].append(grad_norm)
+    
+    def log_val(self, iter_num: int, loss: float, alpha_attn_mean: float = None,
+                peak_mem_mb: float = None, x_norm: float = None, 
+                delta_norm: float = None, linmix_norm: float = None):
+        """Log validation metrics (called at eval intervals).
         
-        if alpha_attn_mean is not None:
-            self.metrics['alpha_attn_mean'].append(alpha_attn_mean)
-        else:
-            self.metrics['alpha_attn_mean'].append(None)
+        Args:
+            iter_num: iteration number
+            loss: validation loss
+            alpha_attn_mean: mean alpha value (optional, for linear mixer)
+            peak_mem_mb: peak GPU memory in MB
+            x_norm: mean activation norm
+            delta_norm: mean representation change norm
+            linmix_norm: mean linear mixer branch norm
+        """
+        self.metrics['val']['iter'].append(iter_num)
+        self.metrics['val']['loss'].append(loss)
+        self.metrics['val']['ppl'].append(math.exp(loss))
+        self.metrics['val']['alpha_attn_mean'].append(alpha_attn_mean)
+        self.metrics['val']['peak_mem_mb'].append(peak_mem_mb)
+        self.metrics['val']['x_norm'].append(x_norm)
+        self.metrics['val']['delta_norm'].append(delta_norm)
+        self.metrics['val']['linmix_norm'].append(linmix_norm)
+    
+    def log(self, iter_num: int, train_loss: float, val_loss: float, 
+            learning_rate: float, alpha_attn_mean: float = None,
+            throughput: float = None, peak_mem_mb: float = None, grad_norm: float = None,
+            x_norm: float = None, delta_norm: float = None, linmix_norm: float = None):
+        """(Deprecated) Log both train and val metrics together for backward compatibility."""
+        self.log_train(iter_num, train_loss, learning_rate, throughput, grad_norm)
+        self.log_val(iter_num, val_loss, alpha_attn_mean, peak_mem_mb, x_norm, delta_norm, linmix_norm)
     
     def save(self):
         """Save metrics to JSON file."""
@@ -79,21 +119,57 @@ class MetricsLogger:
         return self.metrics.copy()
 
 def load_metrics(out_dir: str) -> Dict:
-    """Load metrics from a training run.
+    """Load metrics from a training run and normalize schema.
+
+    Supports both old flat schema and new nested {'train': ..., 'val': ...} schema.
     
     Args:
         out_dir: output directory containing metrics.json
     
     Returns:
-        Dictionary with metrics
+        Dictionary with nested keys: {'train': {...}, 'val': {...}}
     """
     metrics_file = os.path.join(out_dir, 'metrics.json')
     if not os.path.exists(metrics_file):
         print(f"Metrics file not found: {metrics_file}")
         return None
-    
+
     with open(metrics_file, 'r') as f:
-        return json.load(f)
+        data = json.load(f)
+
+    # If already in nested format, return as-is
+    if isinstance(data, dict) and 'train' in data and 'val' in data:
+        # ensure sub-keys exist
+        data.setdefault('train', {})
+        data.setdefault('val', {})
+        for k in ['iter', 'loss', 'ppl', 'learning_rate', 'throughput', 'grad_norm']:
+            data['train'].setdefault(k, [])
+        for k in ['iter', 'loss', 'ppl', 'alpha_attn_mean', 'peak_mem_mb', 'x_norm', 'delta_norm', 'linmix_norm']:
+            data['val'].setdefault(k, [])
+        return data
+
+    # Backward-compat: convert flat schema to nested
+    nested = {
+        'train': {
+            'iter': data.get('iter', []),
+            'loss': data.get('train_loss', []),
+            'ppl': data.get('train_ppl', []),
+            'learning_rate': data.get('learning_rate', []),
+            'throughput': data.get('throughput', []),
+            'grad_norm': data.get('grad_norm', []),
+        },
+        'val': {
+            'iter': data.get('iter', []),
+            'loss': data.get('val_loss', []),
+            'ppl': data.get('val_ppl', []),
+            'alpha_attn_mean': data.get('alpha_attn_mean', []),
+            'peak_mem_mb': data.get('peak_mem_mb', []),
+            'x_norm': data.get('x_norm', []),
+            'delta_norm': data.get('delta_norm', []),
+            'linmix_norm': data.get('linmix_norm', []),
+        }
+    }
+    return nested
 
 def plot_comparison(baseline_dir: str = 'out-baseline', 
                    linmix_dir: str = 'out-linmix-option1',
@@ -125,11 +201,11 @@ def plot_comparison(baseline_dir: str = 'out-baseline',
     
     # Plot 1: Validation Loss
     ax = axes[0, 0]
-    if baseline_metrics['iter']:
-        ax.plot(baseline_metrics['iter'], baseline_metrics['val_loss'], 
+    if baseline_metrics['val']['iter']:
+        ax.plot(baseline_metrics['val']['iter'], baseline_metrics['val']['loss'], 
                label='Baseline', linewidth=2, marker='o', markersize=4)
-    if linmix_metrics['iter']:
-        ax.plot(linmix_metrics['iter'], linmix_metrics['val_loss'], 
+    if linmix_metrics['val']['iter']:
+        ax.plot(linmix_metrics['val']['iter'], linmix_metrics['val']['loss'], 
                label='Linear Mixer', linewidth=2, marker='s', markersize=4)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Validation Loss')
@@ -139,11 +215,11 @@ def plot_comparison(baseline_dir: str = 'out-baseline',
     
     # Plot 2: Validation PPL
     ax = axes[0, 1]
-    if baseline_metrics['iter']:
-        ax.plot(baseline_metrics['iter'], baseline_metrics['val_ppl'], 
+    if baseline_metrics['val']['iter']:
+        ax.plot(baseline_metrics['val']['iter'], baseline_metrics['val']['ppl'], 
                label='Baseline', linewidth=2, marker='o', markersize=4)
-    if linmix_metrics['iter']:
-        ax.plot(linmix_metrics['iter'], linmix_metrics['val_ppl'], 
+    if linmix_metrics['val']['iter']:
+        ax.plot(linmix_metrics['val']['iter'], linmix_metrics['val']['ppl'], 
                label='Linear Mixer', linewidth=2, marker='s', markersize=4)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Validation PPL')
@@ -153,11 +229,11 @@ def plot_comparison(baseline_dir: str = 'out-baseline',
     
     # Plot 3: Training Loss
     ax = axes[1, 0]
-    if baseline_metrics['iter']:
-        ax.plot(baseline_metrics['iter'], baseline_metrics['train_loss'], 
+    if baseline_metrics['train']['iter']:
+        ax.plot(baseline_metrics['train']['iter'], baseline_metrics['train']['loss'], 
                label='Baseline', linewidth=2, alpha=0.7)
-    if linmix_metrics['iter']:
-        ax.plot(linmix_metrics['iter'], linmix_metrics['train_loss'], 
+    if linmix_metrics['train']['iter']:
+        ax.plot(linmix_metrics['train']['iter'], linmix_metrics['train']['loss'], 
                label='Linear Mixer', linewidth=2, alpha=0.7)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Training Loss')
@@ -167,10 +243,10 @@ def plot_comparison(baseline_dir: str = 'out-baseline',
     
     # Plot 4: Alpha values (if available)
     ax = axes[1, 1]
-    if linmix_metrics.get('alpha_attn_mean'):
-        alpha_vals = [a for a in linmix_metrics['alpha_attn_mean'] if a is not None]
+    if 'val' in linmix_metrics and linmix_metrics['val'].get('alpha_attn_mean'):
+        alpha_vals = [a for a in linmix_metrics['val']['alpha_attn_mean'] if a is not None]
         if alpha_vals:
-            alpha_iters = [linmix_metrics['iter'][i] for i, a in enumerate(linmix_metrics['alpha_attn_mean']) if a is not None]
+            alpha_iters = [linmix_metrics['val']['iter'][i] for i, a in enumerate(linmix_metrics['val']['alpha_attn_mean']) if a is not None]
             ax.plot(alpha_iters, alpha_vals, 'g-o', linewidth=2, markersize=4)
             ax.set_xlabel('Iteration')
             ax.set_ylabel('Mean α (Attention)')
@@ -217,14 +293,14 @@ def print_convergence_analysis(baseline_dir: str = 'out-baseline',
         linmix_iter = None
         
         # Find first iteration where PPL < threshold
-        for i, ppl in enumerate(baseline_metrics['val_ppl']):
+        for i, ppl in enumerate(baseline_metrics['val']['ppl']):
             if ppl < threshold:
-                baseline_iter = baseline_metrics['iter'][i]
+                baseline_iter = baseline_metrics['val']['iter'][i]
                 break
         
-        for i, ppl in enumerate(linmix_metrics['val_ppl']):
+        for i, ppl in enumerate(linmix_metrics['val']['ppl']):
             if ppl < threshold:
-                linmix_iter = linmix_metrics['iter'][i]
+                linmix_iter = linmix_metrics['val']['iter'][i]
                 break
         
         baseline_str = f"{baseline_iter}" if baseline_iter else "Not reached"
@@ -242,10 +318,10 @@ def print_convergence_analysis(baseline_dir: str = 'out-baseline',
     print("\n\nStability Analysis (variance of last 5 checkpoints):")
     print("-" * 80)
     
-    n_recent = min(5, len(baseline_metrics['val_ppl']))
+    n_recent = min(5, len(baseline_metrics['val']['ppl']))
     
-    baseline_recent = baseline_metrics['val_ppl'][-n_recent:]
-    linmix_recent = linmix_metrics['val_ppl'][-n_recent:]
+    baseline_recent = baseline_metrics['val']['ppl'][-n_recent:]
+    linmix_recent = linmix_metrics['val']['ppl'][-n_recent:]
     
     baseline_var = np.var(baseline_recent) if baseline_recent else 0
     linmix_var = np.var(linmix_recent) if linmix_recent else 0
@@ -257,8 +333,8 @@ def print_convergence_analysis(baseline_dir: str = 'out-baseline',
     # Final performance
     print("\n\nFinal Performance:")
     print("-" * 80)
-    final_baseline_ppl = baseline_metrics['val_ppl'][-1] if baseline_metrics['val_ppl'] else None
-    final_linmix_ppl = linmix_metrics['val_ppl'][-1] if linmix_metrics['val_ppl'] else None
+    final_baseline_ppl = baseline_metrics['val']['ppl'][-1] if baseline_metrics['val']['ppl'] else None
+    final_linmix_ppl = linmix_metrics['val']['ppl'][-1] if linmix_metrics['val']['ppl'] else None
     
     if final_baseline_ppl and final_linmix_ppl:
         improvement = (final_baseline_ppl - final_linmix_ppl) / final_baseline_ppl * 100

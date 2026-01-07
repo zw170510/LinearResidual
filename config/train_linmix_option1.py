@@ -25,14 +25,14 @@ use_mlp_linear = False               # Don't add linear mixer to MLP (yet)
 
 # adamw optimizer
 learning_rate = 3e-4
-max_iters = 1000
+max_iters = 500
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 
 # learning rate decay settings
 warmup_iters = 200
-lr_decay_iters = 1000
+lr_decay_iters = 500
 min_lr = 6e-5
 
 # system

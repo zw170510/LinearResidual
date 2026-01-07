@@ -91,7 +91,59 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class GatedGroupedLinear(nn.Module):
+    """Gated linear mixer with grouped structure (Option 1 from proposal).
+    
+    Implements: linear_out = alpha * (x @ W) where W is block-diagonal.
+    Used to add an explicit linear channel mixing path alongside nonlinear updates.
+    """
+    def __init__(self, n_embd: int, groups: int = 8, alpha_init: float = 0.0):
+        super().__init__()
+        assert n_embd % groups == 0, f"n_embd ({n_embd}) must be divisible by groups ({groups})"
+        self.n_embd = n_embd
+        self.groups = groups
+        self.c = n_embd // groups  # channel size per group
+        
+        # Block-diagonal weight matrix: [groups, c, c]
+        self.W = nn.Parameter(torch.zeros(groups, self.c, self.c))
+        # Learnable scalar gate initialized to zero (baseline behavior)
+        self.a = nn.Parameter(torch.tensor(alpha_init))
+        
+        # Initialize weights
+        nn.init.normal_(self.W, mean=0.0, std=1e-3)
+    
+    @property
+    def alpha(self):
+        """Gated alpha: alpha = a (can be parameterized as sigmoid for capping if needed)"""
+        return self.a
+    
+    def forward(self, x):
+        """Apply gated grouped linear transformation.
+        
+        Args:
+            x: [B, T, d] tensor
+        Returns:
+            [B, T, d] linear residual scaled by alpha
+        """
+        B, T, C = x.shape
+        # Reshape to group structure: [B, T, groups, c]
+        x_grouped = x.view(B, T, self.groups, self.c)
+        # Apply grouped linear transformation: einsum("btgc,gck->btgk", x, W)
+        y_grouped = torch.einsum("btgc,gck->btgk", x_grouped, self.W)
+        # Reshape back: [B, T, d]
+        y = y_grouped.reshape(B, T, C)
+        # Scale by gated alpha
+        return self.alpha * y
+
 class Block(nn.Module):
+    """Transformer block with optional linear+nonlinear decomposition.
+    
+    When use_linear_mixer=True, implements:
+        x' = x + alpha * L(x) + Attn(LN(x))
+        x'' = x' + MLP(LN(x'))
+    
+    where L is a grouped linear mixer.
+    """
 
     def __init__(self, config):
         super().__init__()
@@ -99,10 +151,29 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        
+        # Option 1: Gated grouped linear mixer (disabled by default)
+        self.use_linear_mixer = getattr(config, 'use_linear_mixer', False)
+        if self.use_linear_mixer:
+            linear_groups = getattr(config, 'linear_mixer_groups', 8)
+            self.linmix_attn = GatedGroupedLinear(config.n_embd, groups=linear_groups)
+            # Optionally add linear mixer after MLP too
+            self.use_mlp_linear = getattr(config, 'use_mlp_linear', False)
+            if self.use_mlp_linear:
+                self.linmix_mlp = GatedGroupedLinear(config.n_embd, groups=linear_groups)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        if self.use_linear_mixer:
+            # With linear mixer in attention residual
+            x = x + self.linmix_attn(x) + self.attn(self.ln_1(x))
+            if self.use_mlp_linear:
+                x = x + self.linmix_mlp(x) + self.mlp(self.ln_2(x))
+            else:
+                x = x + self.mlp(self.ln_2(x))
+        else:
+            # Baseline: no linear mixer
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -114,6 +185,10 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    # Linear + Nonlinear Decomposition (Research Proposal)
+    use_linear_mixer: bool = False # Enable Option 1: gated grouped linear mixer
+    linear_mixer_groups: int = 8 # Number of groups for block-diagonal linear mixer
+    use_mlp_linear: bool = False # Apply linear mixer to MLP residual too
 
 class GPT(nn.Module):
 

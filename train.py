@@ -29,15 +29,28 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+# Import linear mixer diagnostics and metrics logger
+try:
+    from analyze_linear_mixer import print_linear_mixer_report, save_linear_mixer_checkpoint
+    has_linmix_analysis = True
+except ImportError:
+    has_linmix_analysis = False
+
+try:
+    from plot_training_curves import create_metrics_logger
+    has_metrics_logger = True
+except ImportError:
+    has_metrics_logger = False
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 500 # 2000
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
@@ -144,11 +157,20 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
+# Include linear mixer config if defined
+use_linear_mixer = globals().get('use_linear_mixer', False)
+linear_mixer_groups = globals().get('linear_mixer_groups', 8)
+use_mlp_linear = globals().get('use_mlp_linear', False)
+
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,
+                  use_linear_mixer=use_linear_mixer, linear_mixer_groups=linear_mixer_groups,
+                  use_mlp_linear=use_mlp_linear) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
+    if use_linear_mixer:
+        print(f"  with linear mixer enabled (groups={linear_mixer_groups}, mlp_linear={use_mlp_linear})")
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
@@ -246,6 +268,11 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+# Initialize metrics logger
+metrics_logger = None
+if has_metrics_logger and master_process:
+    metrics_logger = create_metrics_logger(out_dir)
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -266,6 +293,37 @@ while True:
         val_ppl = math.exp(losses['val'])
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         print(f"step {iter_num}: train ppl {train_ppl:.2f}, val ppl {val_ppl:.2f}")
+        
+        # Print linear mixer diagnostics if enabled
+        if has_linmix_analysis:
+            try:
+                raw_model_obj = raw_model
+                if hasattr(raw_model_obj, 'config'):
+                    if getattr(raw_model_obj.config, 'use_linear_mixer', False):
+                        metrics = {'train_loss': losses['train'], 'val_loss': losses['val'], 
+                                  'train_ppl': train_ppl, 'val_ppl': val_ppl}
+                        print_linear_mixer_report(raw_model_obj, iter_num, metrics)
+            except Exception as e:
+                if master_process:
+                    print(f"Warning: Could not print linear mixer diagnostics: {e}")
+        
+        # Log metrics
+        if metrics_logger:
+            try:
+                from analyze_linear_mixer import extract_linear_mixer_stats
+                alpha_mean = None
+                if getattr(raw_model.config, 'use_linear_mixer', False):
+                    stats = extract_linear_mixer_stats(raw_model)
+                    if stats['alpha_attn']:
+                        alpha_mean = sum(stats['alpha_attn']) / len(stats['alpha_attn'])
+                
+                metrics_logger.log(iter_num, losses['train'].item(), losses['val'].item(), 
+                                 lr, alpha_mean)
+                metrics_logger.save()
+            except Exception as e:
+                if master_process:
+                    print(f"Warning: Could not log metrics: {e}")
+        
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -288,7 +346,11 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                # Use save_linear_mixer_checkpoint if available, otherwise fallback to torch.save
+                if has_linmix_analysis and getattr(raw_model.config, 'use_linear_mixer', False):
+                    save_linear_mixer_checkpoint(raw_model, checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                else:
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 

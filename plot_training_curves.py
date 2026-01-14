@@ -173,12 +173,14 @@ def load_metrics(out_dir: str) -> Dict:
 
 def plot_comparison(baseline_dir: str = 'out-baseline', 
                    linmix_dir: str = 'out-linmix-option1',
+                   third_dir: str = None,
                    output_file: str = 'comparison.png'):
-    """Plot comparison between baseline and linear mixer training.
+    """Plot comparison between multiple training runs (2 or 3).
     
     Args:
         baseline_dir: directory with baseline training
         linmix_dir: directory with linear mixer training
+        third_dir: optional third directory for comparison
         output_file: output file for the plot
     """
     try:
@@ -191,50 +193,56 @@ def plot_comparison(baseline_dir: str = 'out-baseline',
     # Load metrics
     baseline_metrics = load_metrics(baseline_dir)
     linmix_metrics = load_metrics(linmix_dir)
+    third_metrics = load_metrics(third_dir) if third_dir else None
     
     if baseline_metrics is None or linmix_metrics is None:
         return
     
+    # Prepare labels and colors
+    runs = [
+        ('Baseline', baseline_metrics, 'o', '#1f77b4'),
+        ('Linear Mixer', linmix_metrics, 's', '#ff7f0e'),
+    ]
+    if third_metrics:
+        runs.append(('Third Run', third_metrics, '^', '#2ca02c'))
+    
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('Training Comparison: Baseline vs Linear Mixer', fontsize=16)
+    title = 'Training Comparison: ' + ' vs '.join([r[0] for r in runs])
+    fig.suptitle(title, fontsize=16)
     
     # Plot 1: Validation Loss
     ax = axes[0, 0]
-    if baseline_metrics['val']['iter']:
-        ax.plot(baseline_metrics['val']['iter'], baseline_metrics['val']['loss'], 
-               label='Baseline', linewidth=2, marker='o', markersize=4)
-    if linmix_metrics['val']['iter']:
-        ax.plot(linmix_metrics['val']['iter'], linmix_metrics['val']['loss'], 
-               label='Linear Mixer', linewidth=2, marker='s', markersize=4)
+    for label, metrics, marker, color in runs:
+        if metrics['val']['iter']:
+            ax.plot(metrics['val']['iter'], metrics['val']['loss'], 
+                   label=label, linewidth=2, marker=marker, markersize=4, color=color)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Validation Loss')
     ax.set_title('Validation Loss')
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    # Plot 2: Validation PPL
+    # Plot 2: Validation PPL (log scale)
     ax = axes[0, 1]
-    if baseline_metrics['val']['iter']:
-        ax.plot(baseline_metrics['val']['iter'], baseline_metrics['val']['ppl'], 
-               label='Baseline', linewidth=2, marker='o', markersize=4)
-    if linmix_metrics['val']['iter']:
-        ax.plot(linmix_metrics['val']['iter'], linmix_metrics['val']['ppl'], 
-               label='Linear Mixer', linewidth=2, marker='s', markersize=4)
+    for label, metrics, marker, color in runs:
+        if metrics['val']['iter'] and metrics['val']['ppl']:
+            # Take log of PPL for better visualization
+            log_ppl = [np.log(p) if p > 0 else 0 for p in metrics['val']['ppl']]
+            ax.plot(metrics['val']['iter'], log_ppl, 
+                   label=label, linewidth=2, marker=marker, markersize=4, color=color)
     ax.set_xlabel('Iteration')
-    ax.set_ylabel('Validation PPL')
-    ax.set_title('Validation Perplexity')
+    ax.set_ylabel('log(Validation PPL)')
+    ax.set_title('Validation Perplexity (log scale)')
     ax.legend()
     ax.grid(True, alpha=0.3)
     
     # Plot 3: Training Loss
     ax = axes[1, 0]
-    if baseline_metrics['train']['iter']:
-        ax.plot(baseline_metrics['train']['iter'], baseline_metrics['train']['loss'], 
-               label='Baseline', linewidth=2, alpha=0.7)
-    if linmix_metrics['train']['iter']:
-        ax.plot(linmix_metrics['train']['iter'], linmix_metrics['train']['loss'], 
-               label='Linear Mixer', linewidth=2, alpha=0.7)
+    for label, metrics, marker, color in runs:
+        if metrics['train']['iter']:
+            ax.plot(metrics['train']['iter'], metrics['train']['loss'], 
+                   label=label, linewidth=2, alpha=0.7, color=color)
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Training Loss')
     ax.set_title('Training Loss')
@@ -353,6 +361,8 @@ if __name__ == '__main__':
                         help='Baseline output directory')
     parser.add_argument('--linmix_dir', type=str, default='out-linmix-option1',
                         help='Linear mixer output directory')
+    parser.add_argument('--third_dir', type=str, default=None,
+                        help='Optional third output directory for comparison')
     parser.add_argument('--plot', action='store_true', help='Generate comparison plot')
     parser.add_argument('--analyze', action='store_true', help='Print convergence analysis')
     parser.add_argument('--output', type=str, default='comparison.png',
@@ -364,9 +374,9 @@ if __name__ == '__main__':
         print_convergence_analysis(args.baseline_dir, args.linmix_dir)
     
     if args.plot:
-        plot_comparison(args.baseline_dir, args.linmix_dir, args.output)
+        plot_comparison(args.baseline_dir, args.linmix_dir, args.third_dir, args.output)
     
     if not args.plot and not args.analyze:
         # Default: do both
         print_convergence_analysis(args.baseline_dir, args.linmix_dir)
-        plot_comparison(args.baseline_dir, args.linmix_dir, args.output)
+        plot_comparison(args.baseline_dir, args.linmix_dir, args.third_dir, args.output)

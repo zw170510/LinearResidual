@@ -92,12 +92,19 @@ class MLP(nn.Module):
         return x
 
 class GatedGroupedLinear(nn.Module):
-    """Gated linear mixer with grouped structure (Option 1 from proposal).
+    """Gated linear mixer with grouped (block-diagonal) structure.
     
     Implements: linear_out = alpha * (x @ W) where W is block-diagonal.
-    Used to add an explicit linear channel mixing path alongside nonlinear updates.
+    Parameterization:
+        - W = blkdiag(W_1, ..., W_n): groups g, each size c×c where c = d/g
+    
+    Stabilization options:
+        - gate_cap + weight_decay: alpha = alpha_max * sigmoid(a), apply L2 to W
+        - ortho_reg: encourage M_eff = I + alpha*W to be near-orthogonal
+        - spectral_norm: constrain ||W||_2 via spectral normalization
     """
-    def __init__(self, n_embd: int, groups: int = 8, alpha_init: float = 0.0):
+    def __init__(self, n_embd: int, groups: int = 8, alpha_init: float = 0.0,
+                 gate_cap: float = None, ortho_reg: float = 0.0, spectral_norm: float = None):
         super().__init__()
         assert n_embd % groups == 0, f"n_embd ({n_embd}) must be divisible by groups ({groups})"
         self.n_embd = n_embd
@@ -109,13 +116,68 @@ class GatedGroupedLinear(nn.Module):
         # Learnable scalar gate initialized to zero (baseline behavior)
         self.a = nn.Parameter(torch.tensor(alpha_init))
         
+        # Stabilization hyperparameters
+        self.gate_cap = gate_cap  # If not None, alpha = gate_cap * sigmoid(a)
+        self.ortho_reg = ortho_reg  # Orthogonal regularization strength
+        self.spectral_norm_bound = spectral_norm  # If not None, spectral normalization target
+        
+        # For spectral norm: precomputed u vectors for power iteration
+        if self.spectral_norm_bound is not None:
+            self.register_buffer('u', torch.randn(groups, self.c))
+        
         # Initialize weights
         nn.init.normal_(self.W, mean=0.0, std=1e-3)
     
     @property
     def alpha(self):
-        """Gated alpha: alpha = a (can be parameterized as sigmoid for capping if needed)"""
-        return self.a
+        """Gated alpha with optional capping via sigmoid."""
+        if self.gate_cap is not None:
+            return self.gate_cap * torch.sigmoid(self.a)
+        else:
+            return self.a
+    
+    def spectral_normalize(self):
+        """Apply spectral normalization: scale each block to have ||W_i||_2 <= bound."""
+        if self.spectral_norm_bound is None:
+            return
+        
+        # Power iteration for each block
+        for i in range(self.groups):
+            W_i = self.W[i]  # [c, c]
+            # One power iteration: v = W^T u / ||W^T u||
+            v = W_i.T @ self.u[i]
+            v = v / (torch.norm(v) + 1e-12)
+            # u = W v / ||W v||
+            u_new = W_i @ v
+            s = torch.norm(u_new)
+            u_new = u_new / (s + 1e-12)
+            
+            # Update u
+            self.u[i].copy_(u_new)
+            
+            # Scale W if needed
+            if s > self.spectral_norm_bound:
+                self.W[i].data = self.W[i].data / (s / self.spectral_norm_bound)
+    
+    def ortho_loss(self):
+        """Compute orthogonal regularization loss: ||M_eff^T M_eff - I||_F^2.
+        
+        where M_eff = I + alpha * W (block-wise).
+        """
+        if self.ortho_reg == 0.0:
+            return 0.0
+        
+        alpha_val = self.alpha
+        loss = 0.0
+        
+        for i in range(self.groups):
+            # M_eff_i = I + alpha * W_i
+            M_i = torch.eye(self.c, device=self.W.device, dtype=self.W.dtype) + alpha_val * self.W[i]
+            # ||M_eff^T M_eff - I||_F^2
+            gram = M_i.T @ M_i
+            loss = loss + torch.sum((gram - torch.eye(self.c, device=self.W.device, dtype=self.W.dtype)) ** 2)
+        
+        return self.ortho_reg * loss / self.groups
     
     def forward(self, x):
         """Apply gated grouped linear transformation.
@@ -125,6 +187,9 @@ class GatedGroupedLinear(nn.Module):
         Returns:
             [B, T, d] linear residual scaled by alpha
         """
+        # Apply spectral norm if needed
+        self.spectral_normalize()
+        
         B, T, C = x.shape
         # Reshape to group structure: [B, T, groups, c]
         x_grouped = x.view(B, T, self.groups, self.c)
@@ -135,14 +200,201 @@ class GatedGroupedLinear(nn.Module):
         # Scale by gated alpha
         return self.alpha * y
 
+
+class GatedLowRankLinear(nn.Module):
+    """Gated linear mixer with low-rank parameterization.
+    
+    Implements: linear_out = alpha * (x @ W) where W = U V^T
+    Parameterization:
+        - U, V: [d, r] matrices (rank r << d)
+    
+    Same stabilization options as GatedGroupedLinear.
+    """
+    def __init__(self, n_embd: int, rank: int, alpha_init: float = 0.0,
+                 gate_cap: float = None, ortho_reg: float = 0.0, spectral_norm: float = None):
+        super().__init__()
+        assert rank <= n_embd, f"rank ({rank}) must be <= n_embd ({n_embd})"
+        self.n_embd = n_embd
+        self.rank = rank
+        
+        # Low-rank factorization: W = U V^T
+        self.U = nn.Parameter(torch.zeros(n_embd, rank))
+        self.V = nn.Parameter(torch.zeros(n_embd, rank))
+        # Learnable scalar gate
+        self.a = nn.Parameter(torch.tensor(alpha_init))
+        
+        # Stabilization hyperparameters
+        self.gate_cap = gate_cap
+        self.ortho_reg = ortho_reg
+        self.spectral_norm_bound = spectral_norm
+        
+        # For spectral norm: store singular vectors
+        if self.spectral_norm_bound is not None:
+            self.register_buffer('u_vec', torch.randn(n_embd))
+            self.register_buffer('v_vec', torch.randn(rank))
+        
+        # Initialize weights
+        nn.init.normal_(self.U, mean=0.0, std=1e-3)
+        nn.init.normal_(self.V, mean=0.0, std=1e-3)
+    
+    @property
+    def alpha(self):
+        if self.gate_cap is not None:
+            return self.gate_cap * torch.sigmoid(self.a)
+        else:
+            return self.a
+    
+    def spectral_normalize(self):
+        """Power iteration to estimate and constrain ||W||_2."""
+        if self.spectral_norm_bound is None:
+            return
+        
+        # W = U V^T, so W^T W = V U^T U V^T
+        # Power iteration: v_new = W^T W v / ||W^T W v||
+        v_new = self.V @ (self.U.T @ (self.U @ self.v_vec))
+        s = torch.norm(v_new)
+        v_new = v_new / (s + 1e-12)
+        self.v_vec.copy_(v_new)
+        
+        # u_new = W v / ||W v||
+        u_new = self.U @ (self.V.T @ v_new)
+        u_new = u_new / (torch.norm(u_new) + 1e-12)
+        self.u_vec.copy_(u_new)
+        
+        # Spectral norm is approximately sqrt(s)
+        sigma = torch.sqrt(s) if s > 0 else torch.tensor(1.0, device=s.device)
+        
+        # Scale if needed
+        if sigma > self.spectral_norm_bound:
+            scale = self.spectral_norm_bound / (sigma + 1e-12)
+            self.U.data = self.U.data * scale
+    
+    def ortho_loss(self):
+        """Orthogonal regularization for full matrix."""
+        if self.ortho_reg == 0.0:
+            return 0.0
+        
+        alpha_val = self.alpha
+        # W = U V^T
+        W = self.U @ self.V.T
+        # M_eff = I + alpha * W
+        M = torch.eye(self.n_embd, device=self.U.device, dtype=self.U.dtype) + alpha_val * W
+        # ||M^T M - I||_F^2
+        gram = M.T @ M
+        loss = torch.sum((gram - torch.eye(self.n_embd, device=self.U.device, dtype=self.U.dtype)) ** 2)
+        return self.ortho_reg * loss
+    
+    def forward(self, x):
+        """Apply gated low-rank linear transformation.
+        
+        Args:
+            x: [B, T, d] tensor
+        Returns:
+            [B, T, d] linear residual scaled by alpha
+        """
+        self.spectral_normalize()
+        
+        # W = U V^T, so x @ W = x @ U @ V^T
+        # For efficiency: (x @ U) @ V^T
+        B, T, C = x.shape
+        y = x @ self.U @ self.V.T
+        return self.alpha * y
+
+
+class GatedDenseLinear(nn.Module):
+    """Gated linear mixer with dense (full) weight matrix.
+    
+    Implements: linear_out = alpha * (x @ W) where W is [d, d] dense
+    
+    Warning: most expressive but requires careful stabilization.
+    Same stabilization options as above.
+    """
+    def __init__(self, n_embd: int, alpha_init: float = 0.0,
+                 gate_cap: float = None, ortho_reg: float = 0.0, spectral_norm: float = None):
+        super().__init__()
+        self.n_embd = n_embd
+        
+        # Full dense weight matrix
+        self.W = nn.Parameter(torch.zeros(n_embd, n_embd))
+        # Learnable scalar gate
+        self.a = nn.Parameter(torch.tensor(alpha_init))
+        
+        # Stabilization hyperparameters
+        self.gate_cap = gate_cap
+        self.ortho_reg = ortho_reg
+        self.spectral_norm_bound = spectral_norm
+        
+        # For spectral norm: singular vector estimates
+        if self.spectral_norm_bound is not None:
+            self.register_buffer('u_vec', torch.randn(n_embd))
+            self.register_buffer('v_vec', torch.randn(n_embd))
+        
+        # Initialize weights
+        nn.init.normal_(self.W, mean=0.0, std=1e-3)
+    
+    @property
+    def alpha(self):
+        if self.gate_cap is not None:
+            return self.gate_cap * torch.sigmoid(self.a)
+        else:
+            return self.a
+    
+    def spectral_normalize(self):
+        """Power iteration to estimate and constrain ||W||_2."""
+        if self.spectral_norm_bound is None:
+            return
+        
+        # Power iteration: v_new = W^T u / ||W^T u||
+        v_new = self.W.T @ self.u_vec
+        v_new = v_new / (torch.norm(v_new) + 1e-12)
+        self.v_vec.copy_(v_new)
+        
+        # u_new = W v / ||W v||
+        u_new = self.W @ v_new
+        s = torch.norm(u_new)
+        u_new = u_new / (s + 1e-12)
+        self.u_vec.copy_(u_new)
+        
+        # Spectral norm is s
+        if s > self.spectral_norm_bound:
+            scale = self.spectral_norm_bound / (s + 1e-12)
+            self.W.data = self.W.data * scale
+    
+    def ortho_loss(self):
+        """Orthogonal regularization."""
+        if self.ortho_reg == 0.0:
+            return 0.0
+        
+        alpha_val = self.alpha
+        # M_eff = I + alpha * W
+        M = torch.eye(self.n_embd, device=self.W.device, dtype=self.W.dtype) + alpha_val * self.W
+        # ||M^T M - I||_F^2
+        gram = M.T @ M
+        I = torch.eye(self.n_embd, device=self.W.device, dtype=self.W.dtype)
+        loss = torch.sum((gram - I) ** 2)
+        return self.ortho_reg * loss
+    
+    def forward(self, x):
+        """Apply gated dense linear transformation.
+        
+        Args:
+            x: [B, T, d] tensor
+        Returns:
+            [B, T, d] linear residual scaled by alpha
+        """
+        self.spectral_normalize()
+        
+        y = x @ self.W
+        return self.alpha * y
+
 class Block(nn.Module):
     """Transformer block with optional linear+nonlinear decomposition.
     
     When use_linear_mixer=True, implements:
         x' = x + alpha * L(x) + Attn(LN(x))
-        x'' = x' + MLP(LN(x'))
+        x'' = x' + MLP(LN(x')) [+ alpha2 * L2(x') if use_mlp_linear]
     
-    where L is a grouped linear mixer.
+    where L is a linear mixer (grouped, low-rank, or dense).
     """
 
     def __init__(self, config):
@@ -152,15 +404,58 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
         
-        # Option 1: Gated grouped linear mixer (disabled by default)
+        # Linear mixer configuration
         self.use_linear_mixer = getattr(config, 'use_linear_mixer', False)
         if self.use_linear_mixer:
-            linear_groups = getattr(config, 'linear_mixer_groups', 8)
-            self.linmix_attn = GatedGroupedLinear(config.n_embd, groups=linear_groups)
+            # Get configuration
+            linear_type = getattr(config, 'linear_mixer_type', 'grouped')  # grouped, lowrank, dense
+            
+            # Extract stabilization parameters
+            gate_cap = getattr(config, 'linear_mixer_gate_cap', None)
+            ortho_reg = getattr(config, 'linear_mixer_ortho_reg', 0.0)
+            spectral_norm = getattr(config, 'linear_mixer_spectral_norm', None)
+            
+            # Create linear mixer for attention residual
+            if linear_type == 'grouped':
+                groups = getattr(config, 'linear_mixer_groups', 8)
+                self.linmix_attn = GatedGroupedLinear(
+                    config.n_embd, groups=groups,
+                    gate_cap=gate_cap, ortho_reg=ortho_reg, spectral_norm=spectral_norm
+                )
+            elif linear_type == 'lowrank':
+                rank = getattr(config, 'linear_mixer_rank', config.n_embd // 4)
+                self.linmix_attn = GatedLowRankLinear(
+                    config.n_embd, rank=rank,
+                    gate_cap=gate_cap, ortho_reg=ortho_reg, spectral_norm=spectral_norm
+                )
+            elif linear_type == 'dense':
+                self.linmix_attn = GatedDenseLinear(
+                    config.n_embd,
+                    gate_cap=gate_cap, ortho_reg=ortho_reg, spectral_norm=spectral_norm
+                )
+            else:
+                raise ValueError(f"Unknown linear_mixer_type: {linear_type}")
+            
             # Optionally add linear mixer after MLP too
             self.use_mlp_linear = getattr(config, 'use_mlp_linear', False)
             if self.use_mlp_linear:
-                self.linmix_mlp = GatedGroupedLinear(config.n_embd, groups=linear_groups)
+                if linear_type == 'grouped':
+                    groups = getattr(config, 'linear_mixer_groups', 8)
+                    self.linmix_mlp = GatedGroupedLinear(
+                        config.n_embd, groups=groups,
+                        gate_cap=gate_cap, ortho_reg=ortho_reg, spectral_norm=spectral_norm
+                    )
+                elif linear_type == 'lowrank':
+                    rank = getattr(config, 'linear_mixer_rank', config.n_embd // 4)
+                    self.linmix_mlp = GatedLowRankLinear(
+                        config.n_embd, rank=rank,
+                        gate_cap=gate_cap, ortho_reg=ortho_reg, spectral_norm=spectral_norm
+                    )
+                elif linear_type == 'dense':
+                    self.linmix_mlp = GatedDenseLinear(
+                        config.n_embd,
+                        gate_cap=gate_cap, ortho_reg=ortho_reg, spectral_norm=spectral_norm
+                    )
 
     def forward(self, x):
         if self.use_linear_mixer:
@@ -175,6 +470,19 @@ class Block(nn.Module):
             x = x + self.attn(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
         return x
+    
+    def get_mixer_losses(self):
+        """Collect orthogonal regularization losses from linear mixers.
+        
+        Returns dict of losses to add to main training loss.
+        """
+        losses = {}
+        if self.use_linear_mixer:
+            if hasattr(self.linmix_attn, 'ortho_loss'):
+                losses['linmix_attn_ortho'] = self.linmix_attn.ortho_loss()
+            if self.use_mlp_linear and hasattr(self.linmix_mlp, 'ortho_loss'):
+                losses['linmix_mlp_ortho'] = self.linmix_mlp.ortho_loss()
+        return losses
 
 @dataclass
 class GPTConfig:
@@ -185,9 +493,18 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    
     # Linear + Nonlinear Decomposition (Research Proposal)
-    use_linear_mixer: bool = False # Enable Option 1: gated grouped linear mixer
-    linear_mixer_groups: int = 8 # Number of groups for block-diagonal linear mixer
+    use_linear_mixer: bool = False # Enable linear mixer
+    linear_mixer_type: str = 'grouped'  # 'grouped', 'lowrank', or 'dense'
+    linear_mixer_groups: int = 8 # For grouped type: number of groups for block-diagonal
+    linear_mixer_rank: int = None # For lowrank type: rank (default n_embd // 4)
+    
+    # Stabilization strategies
+    linear_mixer_gate_cap: float = None  # If set, alpha = gate_cap * sigmoid(a). Try [0.25, 0.5, 1.0]
+    linear_mixer_ortho_reg: float = 0.0  # Orthogonal regularization strength lambda_orth
+    linear_mixer_spectral_norm: float = None  # If set, constrain ||W||_2 <= this bound
+    
     use_mlp_linear: bool = False # Apply linear mixer to MLP residual too
 
 class GPT(nn.Module):
@@ -241,6 +558,20 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def get_mixer_losses(self):
+        """Collect orthogonal regularization losses from all blocks.
+        
+        Returns:
+            dict: mapping loss name to value (scalar tensors)
+        """
+        all_losses = {}
+        for i, block in enumerate(self.transformer.h):
+            if hasattr(block, 'get_mixer_losses'):
+                block_losses = block.get_mixer_losses()
+                for name, val in block_losses.items():
+                    all_losses[f"block_{i}_{name}"] = val
+        return all_losses
 
     def forward(self, idx, targets=None):
         device = idx.device

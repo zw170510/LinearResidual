@@ -2,7 +2,7 @@
 # Gated Grouped Linear Mixer in Attention Residual
 
 # I/O
-out_dir = 'out-linmix-option1'
+out_dir = 'out-linmix-option1-16'
 eval_interval = 500
 eval_iters = 100
 
@@ -20,19 +20,19 @@ dropout = 0.0
 
 # Linear + Nonlinear Decomposition (Option 1)
 use_linear_mixer = True              # Enable linear mixer
-linear_mixer_groups = 8              # Block-diagonal groups
+linear_mixer_groups = 16              # Block-diagonal groups
 use_mlp_linear = False               # Don't add linear mixer to MLP (yet)
 
 # adamw optimizer
 learning_rate = 3e-4
-max_iters = 500
+max_iters = 20000
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 
 # learning rate decay settings
 warmup_iters = 200
-lr_decay_iters = 500
+lr_decay_iters = 20000
 min_lr = 6e-5
 
 # system

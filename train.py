@@ -159,12 +159,20 @@ if os.path.exists(meta_path):
 # model init
 # Include linear mixer config if defined
 use_linear_mixer = globals().get('use_linear_mixer', False)
+linear_mixer_type = globals().get('linear_mixer_type', 'grouped')
 linear_mixer_groups = globals().get('linear_mixer_groups', 8)
+linear_mixer_rank = globals().get('linear_mixer_rank', None)
+linear_mixer_gate_cap = globals().get('linear_mixer_gate_cap', None)
+linear_mixer_ortho_reg = globals().get('linear_mixer_ortho_reg', 0.0)
+linear_mixer_spectral_norm = globals().get('linear_mixer_spectral_norm', None)
 use_mlp_linear = globals().get('use_mlp_linear', False)
 
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
-                  use_linear_mixer=use_linear_mixer, linear_mixer_groups=linear_mixer_groups,
+                  use_linear_mixer=use_linear_mixer, linear_mixer_type=linear_mixer_type,
+                  linear_mixer_groups=linear_mixer_groups, linear_mixer_rank=linear_mixer_rank,
+                  linear_mixer_gate_cap=linear_mixer_gate_cap, linear_mixer_ortho_reg=linear_mixer_ortho_reg,
+                  linear_mixer_spectral_norm=linear_mixer_spectral_norm,
                   use_mlp_linear=use_mlp_linear) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch

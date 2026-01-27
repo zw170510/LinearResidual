@@ -24,11 +24,23 @@ def extract_linear_mixer_stats(model):
         if hasattr(block, 'linmix_attn'):
             alpha_val = block.linmix_attn.alpha.item()
             stats['alpha_attn'].append(alpha_val)
+            
+            # Get weight norm based on linear mixer type
+            linmix = block.linmix_attn
+            if hasattr(linmix, 'W'):  # GatedGroupedLinear
+                w_norm = linmix.W.norm().item()
+            elif hasattr(linmix, 'U'):  # GatedLowRankLinear
+                # For low-rank: W = U V^T, compute Frobenius norm
+                W = linmix.U @ linmix.V.T
+                w_norm = W.norm().item()
+            else:
+                w_norm = 0.0
+            
             stats['layer_info'].append({
                 'layer': layer_idx,
                 'has_linmix_attn': True,
                 'alpha_attn': alpha_val,
-                'w_norm': block.linmix_attn.W.norm().item(),
+                'w_norm': w_norm,
             })
         
         if hasattr(block, 'linmix_mlp'):
